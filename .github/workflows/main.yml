@@ -1,0 +1,303 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Rama donde se guardan tus datos entre ejecuciones
+  DATA_BRANCH: rdp-data
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # Máximo permitido por GitHub en runners hospedados: 360 min (6 h)
+    timeout-minutes: 360
+
+    steps:
+      - name: Record baseline (apps del runner)
+        shell: pwsh
+        run: |
+          # Paquetes de Chocolatey que ya trae el runner
+          Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object |
+            Set-Content "C:\baseline-choco.txt"
+
+          # Carpetas que ya existen en Program Files
+          Get-ChildItem "C:\Program Files" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object | Set-Content "C:\baseline-pf.txt"
+          Get-ChildItem "C:\Program Files (x86)" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object | Set-Content "C:\baseline-pf86.txt"
+
+          # Programas instalados que ya trae el runner
+          $paths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+            Where-Object DisplayName |
+            ForEach-Object DisplayName | Sort-Object -Unique |
+            Set-Content "C:\baseline-registry.txt"
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 2 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+          Restart-Service -Name TermService -Force
+
+      - name: Restore saved data
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path "C:\Datos" -Force | Out-Null
+
+          $url = "https://x-access-token:$($env:GH_TOKEN)@github.com/$($env:GITHUB_REPOSITORY).git"
+          git clone --depth 1 --branch $env:DATA_BRANCH --single-branch $url C:\restore 2>$null
+
+          if ($LASTEXITCODE -eq 0 -and (Test-Path "C:\restore\Datos")) {
+              robocopy "C:\restore\Datos" "C:\Datos" /E /NFL /NDL /NJH /NJS | Out-Null
+              Write-Host "Datos restaurados en C:\Datos"
+          } else {
+              Write-Host "No hay datos guardados todavía (primera ejecución)."
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          $charSet = @{
+              Upper = [char[]](65..90) # A-Z
+              Lower = [char[]](97..122) # a-z
+              Number = [char[]](48..57) # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+          "RDP_PASSWORD_GEN=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD_GEN"
+          Write-Host "Guarda tu trabajo en C:\Datos"
+          Write-Host "Las apps se restauran en segundo plano; puedes conectarte ya."
+          Write-Host "==================`n"
+
+      - name: Restore saved apps
+        shell: pwsh
+        run: |
+          # 1) Paquetes de Chocolatey
+          $list = "C:\Datos\.apps\choco-packages.txt"
+          if (Test-Path $list) {
+              foreach ($p in (Get-Content $list | Where-Object { $_.Trim() })) {
+                  Write-Host "choco install $p ..."
+                  choco install $p -y --no-progress --limit-output
+              }
+          }
+          $global:LASTEXITCODE = 0
+
+          # 2) Carpetas de programas guardadas
+          $prog = "C:\Datos\.programas"
+          $map = @(
+              @{ Saved = "$prog\PF"; Real = "C:\Program Files" },
+              @{ Saved = "$prog\PF86"; Real = "C:\Program Files (x86)" },
+              @{ Saved = "$prog\Local"; Real = "$prog\Local" } # se ejecutan desde aquí
+          )
+          foreach ($m in $map) {
+              if ((Test-Path $m.Saved) -and ($m.Saved -ne $m.Real)) {
+                  robocopy $m.Saved $m.Real /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
+              }
+          }
+          $global:LASTEXITCODE = 0
+
+          # 3) Accesos directos en el Escritorio de todos los usuarios
+          $shell = New-Object -ComObject WScript.Shell
+          $desk = "C:\Users\Public\Desktop"
+          foreach ($m in $map) {
+              if (-not (Test-Path $m.Saved)) { continue }
+              Get-ChildItem $m.Saved -Directory | ForEach-Object {
+                  $exe = Get-ChildItem $_.FullName -Filter *.exe -File -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -notmatch 'unins|uninstall|update|crash|setup|helper|install' } |
+                         Select-Object -First 1
+                  if ($exe) {
+                      $rel = $exe.FullName.Substring($m.Saved.Length)
+                      $target = "$($m.Real)$rel"
+                      $lnk = $shell.CreateShortcut("$desk\$($_.Name).lnk")
+                      $lnk.TargetPath = $target
+                      $lnk.WorkingDirectory = Split-Path $target
+                      $lnk.Save()
+                      Write-Host "Acceso directo: $($_.Name)"
+                  }
+              }
+          }
+          exit 0
+
+      - name: Maintain Connection
+        shell: pwsh
+        # Termina antes que el job para dejar tiempo al guardado final
+        timeout-minutes: 345
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP activo - $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Save data to repository
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $appsDir = "C:\Datos\.apps"
+          $prog = "C:\Datos\.programas"
+          New-Item -ItemType Directory -Path $appsDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $prog -Force | Out-Null
+          $cap = 500MB
+
+          function Copy-Capped($src, $dst) {
+              $size = (Get-ChildItem $src -Recurse -File -Force -ErrorAction SilentlyContinue |
+                       Measure-Object Length -Sum).Sum
+              if ($size -gt $cap) {
+                  Write-Host "Omitido (más de 500 MB): $src"
+                  return
+              }
+              robocopy $src $dst /E /MAX:99614720 /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
+              $global:LASTEXITCODE = 0
+          }
+
+          function Save-New($srcRoot, $baseFile, $dstRoot) {
+              if (-not (Test-Path $baseFile)) { return }
+              Remove-Item $dstRoot -Recurse -Force -ErrorAction SilentlyContinue
+              $base = @(Get-Content $baseFile)
+              Get-ChildItem $srcRoot -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notin $base -and $_.Name -ne 'Tailscale' } |
+                ForEach-Object { Copy-Capped $_.FullName (Join-Path $dstRoot $_.Name) }
+          }
+
+          # --- Programas nuevos en Program Files ---
+          Save-New "C:\Program Files" "C:\baseline-pf.txt" "$prog\PF"
+          Save-New "C:\Program Files (x86)" "C:\baseline-pf86.txt" "$prog\PF86"
+
+          # --- Programas instalados por usuario (AppData\Local\Programs) ---
+          $lp = "C:\Users\RDP\AppData\Local\Programs"
+          if (Test-Path $lp) {
+              Remove-Item "$prog\Local" -Recurse -Force -ErrorAction SilentlyContinue
+              Get-ChildItem $lp -Directory | ForEach-Object {
+                  Copy-Capped $_.FullName "$prog\Local\$($_.Name)"
+              }
+          }
+
+          # --- Lista de paquetes de Chocolatey instalados por ti ---
+          if (Test-Path "C:\baseline-choco.txt") {
+              $base = @(Get-Content "C:\baseline-choco.txt")
+              $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue |
+                      ForEach-Object Name
+              @($now | Where-Object { $_ -notin $base }) | Sort-Object |
+                Set-Content "$appsDir\choco-packages.txt"
+          }
+
+          # --- Lista de programas instalados (referencia) ---
+          if (Test-Path "C:\baseline-registry.txt") {
+              $baseReg = @(Get-Content "C:\baseline-registry.txt")
+              $paths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                       'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                       'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              $nowReg = Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+                        Where-Object DisplayName | ForEach-Object DisplayName
+              $prev = @()
+              if (Test-Path "$appsDir\programas-instalados.txt") {
+                  $prev = @(Get-Content "$appsDir\programas-instalados.txt")
+              }
+              @(@($nowReg | Where-Object { $_ -notin $baseReg }) + $prev) |
+                Where-Object { $_ } | Sort-Object -Unique |
+                Set-Content "$appsDir\programas-instalados.txt"
+          }
+
+          # --- Subir todo a la rama ---
+          $tmp = "C:\backup"
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "$tmp\Datos" -Force | Out-Null
+          robocopy "C:\Datos" "$tmp\Datos" /E /MAX:99614720 /NFL /NDL /NJH /NJS | Out-Null
+          $global:LASTEXITCODE = 0
+
+          Set-Location $tmp
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b $env:DATA_BRANCH
+          git add -A
+          git commit -q -m "Backup $(Get-Date -Format s)" --allow-empty
+          $url = "https://x-access-token:$($env:GH_TOKEN)@github.com/$($env:GITHUB_REPOSITORY).git"
+          git push --force $url $env:DATA_BRANCH
+          Write-Host "Datos guardados en la rama $env:DATA_BRANCH"
